@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: hyperscalees
+Version: 0.0.1
+Summary: Evolutionary Strategies at the Hyperscale
+Author-email: Bidipta Sarkar <bidiptas13@gmail.com>
+License-Expression: GPL-3.0-only
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: jax
+Requires-Dist: jaxlib
+Requires-Dist: huggingface_hub
+Requires-Dist: tokenizers
+Requires-Dist: einops
+Requires-Dist: torch
+Requires-Dist: importlib_resources
+Requires-Dist: pyrwkv-tokenizer
+Requires-Dist: hydra-core
+Requires-Dist: tyro
+Requires-Dist: optax
+Requires-Dist: datasets
+Requires-Dist: gymnax
+Requires-Dist: distrax
+Requires-Dist: wandb
+Requires-Dist: fire
+Requires-Dist: jupyter
+Requires-Dist: matplotlib
+Requires-Dist: reasoning-gym
+Requires-Dist: transformers
+Requires-Dist: math-verify
+Requires-Dist: antlr4-python3-runtime==4.9.*
