@@ -177,9 +177,42 @@ class MM(Model):
     def _forward(cls, common_params, x, **_):
         return common_params.noiser.do_mm(
             common_params.frozen_noiser_params, common_params.noiser_params,
-            common_params.params, common_params.es_tree_key, common_params.iterinfo, x)
+            common_params.params, common_params.frozen_params,
+            common_params.es_tree_key, common_params.iterinfo, x)
+class BlockMM(Model):
+    @classmethod
+    def rand_init(cls, key, in_dim, out_dim, dtype, block_size=16, **_):
+        if in_dim % block_size != 0:
+            block_size = in_dim
+
+        num_blocks = in_dim // block_size
+
+        weight = jnp.round(
+            jax.random.normal(key, (out_dim, in_dim)) * (2 ** FIXED_POINT)
+        ).astype(dtype)
+
+        block_mults = jnp.ones((out_dim, num_blocks), dtype=jnp.int32)
+        block_shifts = jnp.ones((out_dim, num_blocks), dtype=jnp.int32) * FIXED_POINT
+
+        merged = merge_inits(
+            weight=CommonInit(None, weight, (), MM_PARAM),
+            block_mults=CommonInit(None, block_mults, (), PARAM),
+            block_shifts=CommonInit(None, block_shifts, (), PARAM)
+        )
 
 
+        return merge_frozen(merged, block_size=block_size)
+    @classmethod
+    def _forward(cls, common_params, x, **_):
+        return common_params.noiser.do_mm(
+            common_params.frozen_noiser_params,
+            common_params.noiser_params,
+            common_params.params,
+            common_params.frozen_params,
+            common_params.es_tree_key,
+            common_params.iterinfo,
+            x
+        )
 # ─────────────────────────────────────────────────────────────────────────────
 # Composite model: Linear
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +220,7 @@ class MM(Model):
 class Linear(Model):
     @classmethod
     def rand_init(cls, key, in_dim, out_dim, dtype, use_bias=False, **_):
-        parts = dict(weight=MM.rand_init(key, in_dim, out_dim, dtype))
+        parts = dict(weight=BlockMM.rand_init(key, in_dim, out_dim, dtype))
         if use_bias:
             parts["bias"] = Parameter.rand_init(
                 None, None, None, jnp.zeros(out_dim, dtype=dtype), dtype)
@@ -195,7 +228,7 @@ class Linear(Model):
 
     @classmethod
     def _forward(cls, common_param, x, **_):
-        out = call_submodule(MM, "weight", common_param, x)
+        out = call_submodule(BlockMM, "weight", common_param, x)
         if "bias" in common_param.params:
             out = out + call_submodule(Parameter, "bias", common_param)
         return out
@@ -417,25 +450,61 @@ class QEggRoll:
         return frozen, state
 
     @classmethod
-    def do_mm(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo, x):
-        # x is standard fixed point (16x true value)
-        # param is also 16x true value and need to divide by sqrt(input size)
-        base = jnp.dot(x, param.T, preferred_element_type=jnp.int32)
-             # x @ W.T
+    def do_mm(cls, frozen_noiser_params, noiser_params, params, frozen_params, base_key, iterinfo, x):
+        weight = params["weight"]
+
+
+        block_mults = cls.get_noisy_standard(
+            frozen_noiser_params, noiser_params, params["block_mults"], base_key["block_mults"], iterinfo
+        )
+        block_shifts = cls.get_noisy_standard(
+            frozen_noiser_params, noiser_params, params["block_shifts"], base_key["block_shifts"], iterinfo
+        )
+
+        block_size = frozen_params["block_size"]
+        out_dim, in_dim = weight.shape
+        num_blocks = in_dim // block_size
+
+        # x: (batch, num_blocks, block_size) -> Transpose to (num_blocks, batch, block_size)
+        x_reshaped = x.reshape(-1, num_blocks, block_size).transpose(1, 0, 2).astype(jnp.int32)
+
+        # w: (out_dim, num_blocks, block_size) -> Transpose to (num_blocks, block_size, out_dim)
+        w_reshaped = weight.reshape(out_dim, num_blocks, block_size).transpose(1, 2, 0).astype(jnp.int32)
+
+        #  (num_blocks, batch, out_dim)
+        base_partials = jnp.matmul(x_reshaped, w_reshaped)
+
+        # (num_blocks, 1, out_dim)
+        b_mults = block_mults.T[:, None, :]
+        b_shifts = block_shifts.T[:, None, :]
+
+        # Scale and sum across the block dimension
+        base_scaled_partials = (base_partials * b_mults) >> b_shifts
+        base_activation = jnp.sum(base_scaled_partials, axis=0)
+
+        perturb_activation = 0
         if iterinfo is not None:
-            A, B = _get_lora_update_params(noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params, iterinfo, param, base_key)
-            perturb = jnp.dot(x, B, preferred_element_type=jnp.int32) @ A.T.astype(jnp.int32)
-                    # x @ B @ A.T
-            base += perturb >> (FIXED_POINT + noiser_params["sigma_shift"])
+            #Extract the specific PRNG key for the weight matrix
+            weight_key = base_key["weight"]
 
-        # Normalise: divide by 2^FIXED_POINT * sqrt(in_dim)
-        return jnp.clip(
-                base // ((2 ** FIXED_POINT) * int(np.sqrt(param.shape[-1]))),
-                -MAX, MAX
-                ).astype(param.dtype)
-            # TODO: Usage of np.sqrt here is allowed?
-            # If param is power of 4 it will compile to bit shifting!
+            A, B = _get_lora_update_params(
+                noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params, iterinfo, weight, weight_key
+            )
+            raw_perturb = jnp.dot(x, B, preferred_element_type=jnp.int32) @ A.T.astype(jnp.int32)
 
+            fan_in_shift = int(np.log2(np.sqrt(in_dim)))
+            global_perturb_shift = FIXED_POINT + noiser_params["sigma_shift"] + fan_in_shift
+
+            perturb_activation = raw_perturb >> global_perturb_shift
+
+
+        final_activation = base_activation + perturb_activation
+
+
+        if x.ndim == 1:
+            final_activation = final_activation.squeeze(0)
+
+        return jnp.clip(final_activation, -MAX, MAX).astype(weight.dtype)
     @classmethod
     def get_noisy_standard(cls, fnp, np_, param, base_key, iterinfo):
         if iterinfo is None:
@@ -535,7 +604,7 @@ def make_xor_dataset(n_samples, rng):
 def make_xor_dataset(n_samples, rng):
     x = rng.standard_normal((n_samples, 2)).astype(np.float32)
     labels = ((x[:, 0] > 0) == (x[:, 1] > 0)).astype(np.int32)
-    
+
     # Scale by MAX/2 instead of FIXED_POINT to use more of the int8 range
     x_int8 = np.clip(np.round(x * 48), -127, 127).astype(np.int8)
     y_int8 = np.zeros((n_samples, 2), dtype=np.int8)
@@ -544,35 +613,35 @@ def make_xor_dataset(n_samples, rng):
 
 def make_spiral_dataset(n_samples, rng):
     n = n_samples // 2
-    
+
     # Class 0: first spiral arm
     theta0 = rng.uniform(0, 4 * np.pi, n).astype(np.float32)
     r0     = theta0 / (4 * np.pi)
     x0     = np.stack([r0 * np.cos(theta0), r0 * np.sin(theta0)], axis=1)
-    
+
     # Class 1: second spiral arm (offset by pi)
     theta1 = rng.uniform(0, 4 * np.pi, n).astype(np.float32)
     r1     = theta1 / (4 * np.pi)
     x1     = np.stack([r1 * np.cos(theta1 + np.pi),
                        r1 * np.sin(theta1 + np.pi)], axis=1)
-    
+
     # Add noise
     x0 += rng.normal(0, 0.05, x0.shape).astype(np.float32)
     x1 += rng.normal(0, 0.05, x1.shape).astype(np.float32)
-    
+
     x      = np.concatenate([x0, x1], axis=0)
     labels = np.array([0]*n + [1]*n, dtype=np.int32)
-    
+
     # Shuffle
     idx = rng.permutation(n_samples)
     x, labels = x[idx], labels[idx]
-    
+
     # Encode x: spirals live in [-1,1], scale to use most of int8 range
     x_int8 = np.clip(np.round(x * 80), -127, 127).astype(np.int8)
-    
+
     y_int8 = np.zeros((n_samples, 2), dtype=np.int8)
     y_int8[np.arange(n_samples), labels] = 64
-    
+
     return jnp.array(x_int8), jnp.array(y_int8)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -712,7 +781,7 @@ def main():
             avg_fitness  = jnp.mean(raw_scores.astype(jnp.float32)).item()
             print(f"  epoch {epoch:4d} | avg_fitness {avg_fitness:8.1f} "
                   f"| test_acc {accuracy:.3f}")
-            
+
             # Extra debbuging (TODO: Delete this.)
             '''
             sorted_idx = jnp.argsort(raw_scores)[::-1]  # best to worst
@@ -727,7 +796,7 @@ def main():
             print(f"    fitnesses unique values: {jnp.unique(fitnesses)}")
             print(f"    params sample (head weight first row): "
                 f"{params['head']['weight'][0, :4]}")
-            
+
             if 'prev_param' in dir():
                 n_changed = sum(
                         int(jnp.sum(p1 != p2))
