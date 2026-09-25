@@ -191,17 +191,23 @@ class BlockMM(Model):
             jax.random.normal(key, (out_dim, in_dim)) * (2 ** FIXED_POINT)
         ).astype(dtype)
 
-        block_mults = jnp.ones((out_dim, num_blocks), dtype=jnp.int32)
-        block_shifts = jnp.ones((out_dim, num_blocks), dtype=jnp.int32) * FIXED_POINT
+        fan_in_shift = int(np.log2(np.sqrt(in_dim)))
+
+
+        initial_shift = FIXED_POINT + fan_in_shift + FIXED_POINT
+
+        block_mults = jnp.ones((out_dim, num_blocks), dtype=jnp.int32) * (2 ** FIXED_POINT)
+        block_shifts = jnp.ones((out_dim, num_blocks), dtype=jnp.int32) * initial_shift
 
         merged = merge_inits(
             weight=CommonInit(None, weight, (), MM_PARAM),
             block_mults=CommonInit(None, block_mults, (), PARAM),
-            block_shifts=CommonInit(None, block_shifts, (), PARAM)
+
+            block_shifts=CommonInit(None, block_shifts, (), EXCLUDED)
         )
 
-
         return merge_frozen(merged, block_size=block_size)
+
     @classmethod
     def _forward(cls, common_params, x, **_):
         return common_params.noiser.do_mm(
@@ -453,12 +459,13 @@ class QEggRoll:
     def do_mm(cls, frozen_noiser_params, noiser_params, params, frozen_params, base_key, iterinfo, x):
         weight = params["weight"]
 
+
         block_mults = cls.get_noisy_standard(
             frozen_noiser_params, noiser_params, params["block_mults"], base_key["block_mults"], iterinfo
         )
-        block_shifts = cls.get_noisy_standard(
-            frozen_noiser_params, noiser_params, params["block_shifts"], base_key["block_shifts"], iterinfo
-        )
+
+
+        block_shifts = params["block_shifts"]
 
         block_size = frozen_params["block_size"]
         out_dim, in_dim = weight.shape
@@ -469,12 +476,8 @@ class QEggRoll:
 
         base_activation = jnp.zeros(out_dim, dtype=jnp.int32)
 
-
         for b in range(num_blocks):
-
             p_b = jnp.dot(x_blocks[b], w_blocks[:, b, :].T, preferred_element_type=jnp.int32)
-
-            # Scale and accumulate immediately to prevent massive intermediate tensors
             scaled_b = (p_b * block_mults[:, b]) >> block_shifts[:, b]
             base_activation += scaled_b
 
@@ -488,7 +491,8 @@ class QEggRoll:
             raw_perturb = jnp.dot(x, B, preferred_element_type=jnp.int32) @ A.T.astype(jnp.int32)
 
             fan_in_shift = int(np.log2(np.sqrt(in_dim)))
-            global_perturb_shift = FIXED_POINT + noiser_params["sigma_shift"] + fan_in_shift
+
+            global_perturb_shift = (2 * FIXED_POINT) + noiser_params["sigma_shift"] + fan_in_shift
 
             perturb_activation = raw_perturb >> global_perturb_shift
 
