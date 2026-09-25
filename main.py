@@ -453,7 +453,6 @@ class QEggRoll:
     def do_mm(cls, frozen_noiser_params, noiser_params, params, frozen_params, base_key, iterinfo, x):
         weight = params["weight"]
 
-
         block_mults = cls.get_noisy_standard(
             frozen_noiser_params, noiser_params, params["block_mults"], base_key["block_mults"], iterinfo
         )
@@ -465,26 +464,22 @@ class QEggRoll:
         out_dim, in_dim = weight.shape
         num_blocks = in_dim // block_size
 
-        # x: (batch, num_blocks, block_size) -> Transpose to (num_blocks, batch, block_size)
-        x_reshaped = x.reshape(-1, num_blocks, block_size).transpose(1, 0, 2).astype(jnp.int32)
+        x_blocks = x.reshape(num_blocks, block_size).astype(jnp.int32)
+        w_blocks = weight.reshape(out_dim, num_blocks, block_size).astype(jnp.int32)
 
-        # w: (out_dim, num_blocks, block_size) -> Transpose to (num_blocks, block_size, out_dim)
-        w_reshaped = weight.reshape(out_dim, num_blocks, block_size).transpose(1, 2, 0).astype(jnp.int32)
+        base_activation = jnp.zeros(out_dim, dtype=jnp.int32)
 
-        #  (num_blocks, batch, out_dim)
-        base_partials = jnp.matmul(x_reshaped, w_reshaped)
 
-        # (num_blocks, 1, out_dim)
-        b_mults = block_mults.T[:, None, :]
-        b_shifts = block_shifts.T[:, None, :]
+        for b in range(num_blocks):
 
-        # Scale and sum across the block dimension
-        base_scaled_partials = (base_partials * b_mults) >> b_shifts
-        base_activation = jnp.sum(base_scaled_partials, axis=0)
+            p_b = jnp.dot(x_blocks[b], w_blocks[:, b, :].T, preferred_element_type=jnp.int32)
+
+            # Scale and accumulate immediately to prevent massive intermediate tensors
+            scaled_b = (p_b * block_mults[:, b]) >> block_shifts[:, b]
+            base_activation += scaled_b
 
         perturb_activation = 0
         if iterinfo is not None:
-            #Extract the specific PRNG key for the weight matrix
             weight_key = base_key["weight"]
 
             A, B = _get_lora_update_params(
@@ -497,12 +492,7 @@ class QEggRoll:
 
             perturb_activation = raw_perturb >> global_perturb_shift
 
-
         final_activation = base_activation + perturb_activation
-
-
-        if x.ndim == 1:
-            final_activation = final_activation.squeeze(0)
 
         return jnp.clip(final_activation, -MAX, MAX).astype(weight.dtype)
     @classmethod
